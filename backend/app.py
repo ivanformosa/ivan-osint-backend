@@ -3,10 +3,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image, ExifTags, ImageStat, ImageFilter
 from pathlib import Path
-import hashlib, io, os, json, datetime, requests
+from urllib.parse import quote_plus
+import hashlib, io, os, json, datetime, requests, re
 
 app = Flask(__name__)
 CORS(app)
+
 TAG_MAP = ExifTags.TAGS
 GPS_TAG_MAP = ExifTags.GPSTAGS
 
@@ -126,6 +128,159 @@ def ocr_space(data, filename):
     except Exception as e:
         return {"enabled": True, "provider": "OCR.space", "text": "", "error": str(e)}
 
+def unique(seq):
+    out, seen = [], set()
+    for x in seq:
+        x = str(x).strip()
+        if x and x.lower() not in seen:
+            out.append(x)
+            seen.add(x.lower())
+    return out
+
+def extract_entities(text, filename="", exif=None, manual=None):
+    exif = exif or {}
+    manual = manual or {}
+    corpus = "\n".join([
+        text or "",
+        filename or "",
+        " ".join([str(v) for v in exif.values() if isinstance(v, (str, int, float))]),
+        " ".join([str(v) for v in manual.values()])
+    ])
+
+    emails = re.findall(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', corpus)
+    urls = re.findall(r'\b(?:https?://|www\.)[^\s<>"\']+', corpus)
+    hashtags = re.findall(r'(?<!\w)#[A-Za-z0-9_]{2,50}\b', corpus)
+    usernames = re.findall(r'(?<![\w@])@[A-Za-z0-9._]{3,40}\b', corpus)
+
+    raw_phones = re.findall(r'(?:(?:\+|00)\d{1,3}[\s.\-]?)?(?:\(?\d{2,4}\)?[\s.\-]?){2,5}\d{2,5}', corpus)
+    phones = []
+    for p in raw_phones:
+        cleaned = re.sub(r'[^\d+]', '', p)
+        digits = re.sub(r'\D', '', cleaned)
+        if 8 <= len(digits) <= 15:
+            phones.append(cleaned)
+
+    plates = re.findall(r'\b[A-Z]{2}\s?\d{3}\s?[A-Z]{2}\b', corpus.upper())
+    fiscal_codes = re.findall(r'\b[A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z]\b', corpus.upper())
+    coordinates = re.findall(r'[-+]?\d{1,2}\.\d{4,}\s*,\s*[-+]?\d{1,3}\.\d{4,}', corpus)
+    domains = re.findall(r'\b(?:[a-zA-Z0-9-]+\.)+(?:it|com|net|org|eu|gov|edu|info|io)\b', corpus)
+
+    return {
+        "phones": unique(phones),
+        "emails": unique(emails),
+        "urls": unique(urls),
+        "domains": unique(domains),
+        "usernames": unique(usernames),
+        "hashtags": unique(hashtags),
+        "possible_plates": unique(plates),
+        "possible_fiscal_codes": unique(fiscal_codes),
+        "coordinates_in_text": unique(coordinates),
+        "device": unique([str(exif.get("Model", "")).strip()] if exif.get("Model") else []),
+        "software": unique([str(exif.get("Software", "")).strip()] if exif.get("Software") else []),
+        "datetime": unique([str(exif.get("DateTime", "")).strip()] if exif.get("DateTime") else [])
+    }
+
+def google_url(q):
+    return "https://www.google.com/search?q=" + quote_plus(q)
+
+def epieos_like_links(entities):
+    links = []
+    for phone in entities.get("phones", []):
+        clean = re.sub(r'\D', '', phone)
+        links += [
+            {"category":"telefono", "value":phone, "name":"Google", "url":google_url(f'"{phone}"')},
+            {"category":"telefono", "value":phone, "name":"Facebook", "url":google_url(f'site:facebook.com "{phone}"')},
+            {"category":"telefono", "value":phone, "name":"Instagram", "url":google_url(f'site:instagram.com "{phone}"')},
+            {"category":"telefono", "value":phone, "name":"Telegram", "url":f"https://t.me/+{clean}"},
+            {"category":"telefono", "value":phone, "name":"WhatsApp", "url":f"https://wa.me/{clean}"},
+            {"category":"telefono", "value":phone, "name":"Truecaller", "url":f"https://www.truecaller.com/search/it/{clean}"},
+            {"category":"telefono", "value":phone, "name":"Sync.me", "url":f"https://sync.me/search/?number={clean}"}
+        ]
+    for email in entities.get("emails", []):
+        links += [
+            {"category":"email", "value":email, "name":"Google", "url":google_url(f'"{email}"')},
+            {"category":"email", "value":email, "name":"LinkedIn", "url":google_url(f'site:linkedin.com "{email}"')},
+            {"category":"email", "value":email, "name":"GitHub", "url":google_url(f'site:github.com "{email}"')},
+            {"category":"email", "value":email, "name":"Gravatar", "url":f"https://en.gravatar.com/site/check/{email}"},
+            {"category":"email", "value":email, "name":"HaveIBeenPwned", "url":"https://haveibeenpwned.com/"}
+        ]
+    for user in entities.get("usernames", []):
+        clean = user.lstrip("@")
+        links += [
+            {"category":"username", "value":user, "name":"Google", "url":google_url(f'"{clean}"')},
+            {"category":"username", "value":user, "name":"Instagram", "url":f"https://www.instagram.com/{clean}/"},
+            {"category":"username", "value":user, "name":"TikTok", "url":f"https://www.tiktok.com/@{clean}"},
+            {"category":"username", "value":user, "name":"X", "url":f"https://x.com/{clean}"},
+            {"category":"username", "value":user, "name":"Reddit", "url":f"https://www.reddit.com/user/{clean}"},
+            {"category":"username", "value":user, "name":"GitHub", "url":f"https://github.com/{clean}"}
+        ]
+    for plate in entities.get("possible_plates", []):
+        links += [
+            {"category":"possibile_targa", "value":plate, "name":"Google", "url":google_url(f'"{plate}"')},
+            {"category":"possibile_targa", "value":plate, "name":"Subito", "url":google_url(f'site:subito.it "{plate}"')},
+            {"category":"possibile_targa", "value":plate, "name":"Autoscout", "url":google_url(f'site:autoscout24.it "{plate}"')}
+        ]
+    return links
+
+def entity_queries(entities):
+    queries = []
+    for phone in entities.get("phones", []):
+        queries += [
+            {"type":"telefono", "value":phone, "query":f'"{phone}"'},
+            {"type":"telefono-facebook", "value":phone, "query":f'site:facebook.com "{phone}"'},
+            {"type":"telefono-instagram", "value":phone, "query":f'site:instagram.com "{phone}"'},
+            {"type":"telefono-subito", "value":phone, "query":f'site:subito.it "{phone}"'}
+        ]
+    for email in entities.get("emails", []):
+        queries += [
+            {"type":"email", "value":email, "query":f'"{email}"'},
+            {"type":"email-linkedin", "value":email, "query":f'site:linkedin.com "{email}"'},
+            {"type":"email-github", "value":email, "query":f'site:github.com "{email}"'}
+        ]
+    for user in entities.get("usernames", []):
+        clean = user.lstrip("@")
+        queries += [
+            {"type":"username", "value":user, "query":f'"{clean}"'},
+            {"type":"username-instagram", "value":user, "query":f'site:instagram.com "{clean}"'},
+            {"type":"username-tiktok", "value":user, "query":f'site:tiktok.com "{clean}"'},
+            {"type":"username-x", "value":user, "query":f'site:x.com "{clean}" OR site:twitter.com "{clean}"'}
+        ]
+    for plate in entities.get("possible_plates", []):
+        queries += [
+            {"type":"possibile-targa", "value":plate, "query":f'"{plate}"'},
+            {"type":"possibile-targa-web", "value":plate, "query":f'"{plate}" auto OR veicolo OR targa'}
+        ]
+    for url in entities.get("urls", []):
+        queries.append({"type":"url", "value":url, "query":f'"{url}"'})
+    for domain in entities.get("domains", []):
+        queries.append({"type":"dominio", "value":domain, "query":f'site:{domain}'})
+    return queries
+
+def investigative_profile(entities, gps, ocr, exif):
+    counts = {k: len(v) for k, v in entities.items() if isinstance(v, list)}
+    score = 0
+    score += counts.get("phones", 0) * 20
+    score += counts.get("emails", 0) * 20
+    score += counts.get("usernames", 0) * 15
+    score += counts.get("urls", 0) * 10
+    score += counts.get("domains", 0) * 10
+    score += counts.get("possible_plates", 0) * 25
+    score += counts.get("possible_fiscal_codes", 0) * 30
+    if gps.get("latitude") is not None: score += 15
+    if ocr.get("text"): score += 10
+    if exif.get("Software"): score += 5
+    score = min(score, 100)
+    priority = "HIGH" if score >= 70 else "MEDIUM" if score >= 35 else "LOW"
+    actions = []
+    if counts.get("phones", 0): actions += ["Verifica telefono su fonti aperte", "Controlla eventuali profili collegati al numero"]
+    if counts.get("emails", 0): actions += ["Verifica email su motori di ricerca", "Controlla eventuali data breach pubblici"]
+    if counts.get("usernames", 0): actions += ["Verifica username sui social principali"]
+    if counts.get("possible_plates", 0): actions += ["Verifica manualmente possibile targa", "Controlla errori OCR su caratteri simili"]
+    if gps.get("latitude") is not None: actions += ["Verifica coordinate su mappa", "Confronta luogo con contesto immagine"]
+    if ocr.get("text"): actions += ["Rileggi manualmente il testo OCR", "Confronta numeri/nomi estratti con l'immagine originale"]
+    actions += ["Esegui reverse image search", "Documenta fonte, data, hash e passaggi eseguiti"]
+    return {"score": score, "priority": priority, "entity_counts": counts, "recommended_actions": unique(actions)}
+
 def reverse_sources():
     return [
         {"name":"Google Lens","url":"https://lens.google.com/"},
@@ -135,7 +290,7 @@ def reverse_sources():
         {"name":"Bing Visual Search","url":"https://www.bing.com/images/search"},
     ]
 
-def build_queries(filename, exif, gps, ocr_text, manual):
+def build_queries(filename, exif, gps, ocr_text, manual, entities):
     stem = Path(filename).stem
     queries = []
     if stem:
@@ -149,13 +304,15 @@ def build_queries(filename, exif, gps, ocr_text, manual):
     if ocr_text:
         words = " ".join(ocr_text.split()[:8])
         if words: queries.append(f'"{words}"')
+    for q in entity_queries(entities):
+        queries.append(q["query"])
     for key in ["luogo","telecamera","veicolo","targa","abbigliamento","oggetti","note"]:
         val = str(manual.get(key,"")).strip()
         if val: queries.append(f'"{val}"')
     queries.append(f'"{filename}"')
-    return [q for q in queries if q and q != '""']
+    return unique(queries)
 
-def checklist(exif, gps, ocr, manual):
+def checklist(exif, gps, ocr, manual, entities):
     items = [
         "Conservare copia originale e hash SHA256 per catena di custodia digitale.",
         "Verificare data/ora di acquisizione e fonte del file originale.",
@@ -168,15 +325,17 @@ def checklist(exif, gps, ocr, manual):
         items.append("GPS assente: usare luogo/telecamera dichiarati o ricostruzione manuale.")
     if ocr.get("text"):
         items.append("OCR utile: verificare targhe, insegne, numeri, orari o parole estratte.")
-    if manual.get("abbigliamento"):
-        items.append("Abbigliamento indicato: può aiutare a collegare fotogrammi diversi senza biometria.")
-    if manual.get("oggetti"):
-        items.append("Oggetti distintivi indicati: verificare ricorrenza in altre riprese.")
+    if entities.get("phones"):
+        items.append("Telefono individuato: effettuare ricerche OSINT solo su fonti pubbliche/autorizzate.")
+    if entities.get("emails") or entities.get("usernames"):
+        items.append("Identificativi online individuati: verificare corrispondenze con più fonti.")
+    if entities.get("possible_plates"):
+        items.append("Possibile targa individuata: verificare manualmente, OCR può commettere errori.")
     return items
 
 @app.get("/")
 def home():
-    return jsonify({"software":"IVAN-OSINT Investigativo v3 Backend","status":"online","endpoints":["/health","/analyze-image"],"optional_env":["OCR_SPACE_API_KEY","SERPAPI_KEY"]})
+    return jsonify({"software":"IVAN-OSINT Investigativo v5 Backend","status":"online","features":["epieos_like_links","investigative_profile","entities","ocr","exif","gps"]})
 
 @app.get("/health")
 def health():
@@ -206,7 +365,9 @@ def analyze_image():
     exif, gps = extract_exif(image)
     quality = image_quality(image)
     ocr = ocr_space(data, filename)
+    entities = extract_entities(ocr.get("text",""), filename, exif, manual)
     serpapi_on = bool(os.environ.get("SERPAPI_KEY","").strip())
+    profile = investigative_profile(entities, gps, ocr, exif)
 
     technical = {
         "filename": filename,
@@ -228,23 +389,26 @@ def analyze_image():
     if not ocr.get("enabled"): warnings.append("OCR non attivo: aggiungere OCR_SPACE_API_KEY su Render se serve.")
     if not serpapi_on: warnings.append("SERPAPI_KEY non presente: reverse image automatico non attivo.")
 
-    report = {
-        "software":"IVAN-OSINT Investigativo v3",
+    return jsonify({
+        "software":"IVAN-OSINT Investigativo v5",
         "created_at": datetime.datetime.utcnow().isoformat()+"Z",
         "case_manual_fields": manual,
+        "investigative_profile": profile,
         "technical": technical,
         "quality": quality,
         "exif": exif,
         "gps": gps,
         "ocr": ocr,
+        "entities": entities,
+        "entity_queries": entity_queries(entities),
+        "epieos_like_links": epieos_like_links(entities),
         "api_status": {"ocr_space":{"enabled": bool(os.environ.get("OCR_SPACE_API_KEY","").strip())}, "serpapi":{"enabled": serpapi_on}},
-        "queries": build_queries(filename, exif, gps, ocr.get("text",""), manual),
+        "queries": build_queries(filename, exif, gps, ocr.get("text",""), manual, entities),
         "reverse_image_sources": reverse_sources(),
-        "investigative_checklist": checklist(exif, gps, ocr, manual),
+        "investigative_checklist": checklist(exif, gps, ocr, manual, entities),
         "warnings": warnings,
         "legal_note": "Uso previsto: analisi tecnica e OSINT su dati autorizzati. Nessun riconoscimento facciale."
-    }
-    return jsonify(report)
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","5000")))
