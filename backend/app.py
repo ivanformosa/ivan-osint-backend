@@ -4,7 +4,7 @@ from flask_cors import CORS
 from PIL import Image, ExifTags, ImageStat, ImageFilter
 from pathlib import Path
 from urllib.parse import quote_plus
-import hashlib, io, os, json, datetime, requests, re
+import hashlib, io, os, json, datetime, requests, re, base64
 
 app = Flask(__name__)
 CORS(app)
@@ -12,9 +12,66 @@ CORS(app)
 TAG_MAP = ExifTags.TAGS
 GPS_TAG_MAP = ExifTags.GPSTAGS
 
-def sha256_bytes(data): return hashlib.sha256(data).hexdigest()
-def md5_bytes(data): return hashlib.md5(data).hexdigest()
-def google_url(q): return "https://www.google.com/search?q=" + quote_plus(q)
+# Optional AI modules. The backend stays alive even if Render Free cannot install heavy AI libs.
+AI = {
+    "ocr_space": True,
+    "opencv": False,
+    "mediapipe": False,
+    "yolo": False,
+    "clip": False
+}
+
+try:
+    import cv2
+    import numpy as np
+    AI["opencv"] = True
+except Exception:
+    cv2 = None
+    np = None
+
+try:
+    import mediapipe as mp
+    AI["mediapipe"] = True
+except Exception:
+    mp = None
+
+try:
+    from ultralytics import YOLO
+    AI["yolo"] = True
+except Exception:
+    YOLO = None
+
+try:
+    import torch
+    from transformers import CLIPProcessor, CLIPModel
+    AI["clip"] = True
+except Exception:
+    torch = None
+    CLIPProcessor = None
+    CLIPModel = None
+
+YOLO_MODEL = None
+CLIP_MODEL = None
+CLIP_PROCESSOR = None
+
+
+def google_url(q): 
+    return "https://www.google.com/search?q=" + quote_plus(q)
+
+def sha256_bytes(data): 
+    return hashlib.sha256(data).hexdigest()
+
+def md5_bytes(data): 
+    return hashlib.md5(data).hexdigest()
+
+def unique(seq):
+    out, seen = [], set()
+    for x in seq:
+        x = str(x).strip()
+        if x and x.lower() not in seen:
+            out.append(x)
+            seen.add(x.lower())
+    return out
 
 def safe_value(value):
     if isinstance(value, bytes):
@@ -26,17 +83,22 @@ def safe_value(value):
         return str(value)
 
 def rational_to_float(x):
-    try: return float(x)
+    try:
+        return float(x)
     except Exception:
-        try: return x[0] / x[1]
-        except Exception: return None
+        try:
+            return x[0] / x[1]
+        except Exception:
+            return None
 
 def gps_to_decimal(values, ref):
     try:
         d, m, s = rational_to_float(values[0]), rational_to_float(values[1]), rational_to_float(values[2])
-        if d is None or m is None or s is None: return None
-        dec = d + m/60 + s/3600
-        if ref in ["S","W"]: dec = -dec
+        if d is None or m is None or s is None:
+            return None
+        dec = d + m / 60 + s / 3600
+        if ref in ["S", "W"]:
+            dec = -dec
         return round(dec, 7)
     except Exception:
         return None
@@ -62,9 +124,13 @@ def difference_hash(image, hash_size=8):
 def extract_exif(image):
     exif_out, gps_raw = {}, {}
     gps_out = {"latitude": None, "longitude": None, "google_maps": None, "raw": {}}
-    try: raw = image.getexif()
-    except Exception: raw = None
-    if not raw: return exif_out, gps_out
+    try:
+        raw = image.getexif()
+    except Exception:
+        raw = None
+    if not raw:
+        return exif_out, gps_out
+
     for tag_id, value in raw.items():
         tag = TAG_MAP.get(tag_id, f"TAG_{tag_id}")
         if tag == "GPSInfo":
@@ -76,11 +142,13 @@ def extract_exif(image):
                 pass
         else:
             exif_out[tag] = safe_value(value)
+
     gps_out["raw"] = gps_raw
     if "GPSLatitude" in gps_raw and "GPSLatitudeRef" in gps_raw:
         gps_out["latitude"] = gps_to_decimal(gps_raw["GPSLatitude"], gps_raw["GPSLatitudeRef"])
     if "GPSLongitude" in gps_raw and "GPSLongitudeRef" in gps_raw:
         gps_out["longitude"] = gps_to_decimal(gps_raw["GPSLongitude"], gps_raw["GPSLongitudeRef"])
+
     if gps_out["latitude"] is not None and gps_out["longitude"] is not None:
         gps_out["google_maps"] = f"https://www.google.com/maps?q={gps_out['latitude']},{gps_out['longitude']}"
     return exif_out, gps_out
@@ -95,10 +163,14 @@ def image_quality(image):
     sharpness = round(ImageStat.Stat(edges).mean[0], 2)
     dominant = rgb.resize((1,1)).getpixel((0,0))
     notes = []
-    if brightness < 45: notes.append("immagine molto scura")
-    elif brightness > 215: notes.append("immagine molto chiara/sovraesposta")
-    if contrast < 25: notes.append("contrasto basso")
-    if sharpness < 8: notes.append("possibile immagine poco nitida o sfocata")
+    if brightness < 45:
+        notes.append("immagine molto scura")
+    elif brightness > 215:
+        notes.append("immagine molto chiara/sovraesposta")
+    if contrast < 25:
+        notes.append("contrasto basso")
+    if sharpness < 8:
+        notes.append("possibile immagine poco nitida o sfocata")
     return {
         "brightness_0_255": brightness,
         "contrast_estimate": contrast,
@@ -127,15 +199,6 @@ def ocr_space(data, filename):
     except Exception as e:
         return {"enabled": True, "provider": "OCR.space", "text": "", "error": str(e)}
 
-def unique(seq):
-    out, seen = [], set()
-    for x in seq:
-        x = str(x).strip()
-        if x and x.lower() not in seen:
-            out.append(x)
-            seen.add(x.lower())
-    return out
-
 def extract_entities(text, filename="", exif=None, manual=None):
     exif = exif or {}
     manual = manual or {}
@@ -145,30 +208,23 @@ def extract_entities(text, filename="", exif=None, manual=None):
         " ".join([str(v) for v in exif.values() if isinstance(v, (str, int, float))]),
         " ".join([str(v) for v in manual.values()])
     ])
-
     emails = re.findall(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', corpus)
     urls = re.findall(r'\b(?:https?://|www\.)[^\s<>"\']+', corpus)
     hashtags = re.findall(r'(?<!\w)#[A-Za-z0-9_]{2,50}\b', corpus)
     usernames = re.findall(r'(?<![\w@])@[A-Za-z0-9._]{3,40}\b', corpus)
-
-    # Also detect bare usernames when user explicitly types "username: ivanformosa" or "ig ivanformosa".
     bare_users = re.findall(r'\b(?:username|user|ig|instagram|telegram|tiktok|x|twitter)\s*[:=@]?\s*([A-Za-z0-9._]{3,40})\b', corpus, flags=re.I)
     usernames += ["@" + u for u in bare_users if "@" not in u]
-
     raw_phones = re.findall(r'(?:(?:\+|00)\d{1,3}[\s.\-]?)?(?:\(?\d{2,4}\)?[\s.\-]?){2,5}\d{2,5}', corpus)
     phones = []
     for p in raw_phones:
         cleaned = re.sub(r'[^\d+]', '', p)
         digits = re.sub(r'\D', '', cleaned)
-        # avoid false positives from dates if too date-like
         if 8 <= len(digits) <= 15:
             phones.append(cleaned)
-
     plates = re.findall(r'\b[A-Z]{2}\s?\d{3}\s?[A-Z]{2}\b', corpus.upper())
     fiscal_codes = re.findall(r'\b[A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z]\b', corpus.upper())
     coordinates = re.findall(r'[-+]?\d{1,2}\.\d{4,}\s*,\s*[-+]?\d{1,3}\.\d{4,}', corpus)
     domains = re.findall(r'\b(?:[a-zA-Z0-9-]+\.)+(?:it|com|net|org|eu|gov|edu|info|io)\b', corpus)
-
     return {
         "phones": unique(phones),
         "emails": unique(emails),
@@ -199,7 +255,7 @@ def phone_enrichment(phone):
     else:
         out["international_format_guess"] = phone
         out["notes"].append("Paese non determinabile senza prefisso internazionale.")
-    if out["country_guess"] == "Italia" and (digits.endswith("") and (digits[-10:].startswith("3"))):
+    if out["country_guess"] == "Italia" and digits[-10:].startswith("3"):
         out["type_guess"] = "mobile italiano probabile"
     elif out["country_guess"] == "Italia":
         out["type_guess"] = "numero italiano probabile"
@@ -208,54 +264,20 @@ def phone_enrichment(phone):
     out["notes"].append("Arricchimento locale euristico: non conferma intestatario, operatore o validità reale.")
     return out
 
-def email_enrichment(email):
-    domain = email.split("@",1)[1].lower() if "@" in email else ""
-    providers = {
-        "gmail.com":"Google/Gmail", "googlemail.com":"Google/Gmail", "outlook.com":"Microsoft Outlook",
-        "hotmail.com":"Microsoft Outlook", "live.com":"Microsoft", "icloud.com":"Apple iCloud",
-        "me.com":"Apple iCloud", "yahoo.com":"Yahoo", "libero.it":"Libero Mail",
-        "virgilio.it":"Virgilio Mail", "pec.it":"PEC generica"
-    }
-    return {
-        "input": email,
-        "domain": domain,
-        "provider_guess": providers.get(domain, "Provider da verificare"),
-        "is_free_provider_guess": domain in providers,
-        "recommended_checks": ["Google exact search", "LinkedIn exact search", "GitHub exact search", "HaveIBeenPwned manuale"]
-    }
-
-def username_enrichment(username):
-    clean = username.lstrip("@")
-    return {
-        "input": username,
-        "normalized": clean,
-        "candidate_urls": {
-            "instagram": f"https://www.instagram.com/{clean}/",
-            "tiktok": f"https://www.tiktok.com/@{clean}",
-            "x": f"https://x.com/{clean}",
-            "reddit": f"https://www.reddit.com/user/{clean}",
-            "github": f"https://github.com/{clean}",
-            "telegram": f"https://t.me/{clean}"
-        },
-        "notes": ["La presenza dell'URL non conferma che il profilo esista: va verificato manualmente."]
-    }
-
-def domain_enrichment(domain):
-    d = domain.lower().replace("www.","")
-    return {
-        "input": domain,
-        "normalized": d,
-        "google_dork": f"site:{d}",
-        "recommended_checks": ["WHOIS", "DNS records", "Google indexed pages", "Wayback Machine"]
-    }
-
 def enrich_entities(entities):
     return {
         "phones": [phone_enrichment(p) for p in entities.get("phones", [])],
-        "emails": [email_enrichment(e) for e in entities.get("emails", [])],
-        "usernames": [username_enrichment(u) for u in entities.get("usernames", [])],
-        "domains": [domain_enrichment(d) for d in entities.get("domains", [])],
-        "possible_plates": [{"input": p, "normalized": p.replace(" ",""), "note":"Possibile targa: verificare manualmente, OCR può confondere caratteri."} for p in entities.get("possible_plates", [])],
+        "emails": [{"input": e, "domain": e.split("@",1)[1].lower() if "@" in e else "", "provider_guess": "Google/Gmail" if e.endswith("@gmail.com") else "da verificare"} for e in entities.get("emails", [])],
+        "usernames": [{"input": u, "normalized": u.lstrip("@"), "candidate_urls": {
+            "instagram": f"https://www.instagram.com/{u.lstrip('@')}/",
+            "tiktok": f"https://www.tiktok.com/@{u.lstrip('@')}",
+            "x": f"https://x.com/{u.lstrip('@')}",
+            "reddit": f"https://www.reddit.com/user/{u.lstrip('@')}",
+            "github": f"https://github.com/{u.lstrip('@')}",
+            "telegram": f"https://t.me/{u.lstrip('@')}"
+        }} for u in entities.get("usernames", [])],
+        "domains": [{"input": d, "google_dork": f"site:{d}", "wayback": f"https://web.archive.org/web/*/{d}"} for d in entities.get("domains", [])],
+        "possible_plates": [{"input": p, "normalized": p.replace(" ",""), "note":"Possibile targa: verificare manualmente."} for p in entities.get("possible_plates", [])],
         "coordinates_in_text": [{"input": c, "google_maps": "https://www.google.com/maps?q=" + quote_plus(c)} for c in entities.get("coordinates_in_text", [])]
     }
 
@@ -291,18 +313,6 @@ def epieos_like_links(entities):
             {"category":"username", "value":user, "name":"GitHub", "url":f"https://github.com/{clean}"},
             {"category":"username", "value":user, "name":"Telegram", "url":f"https://t.me/{clean}"}
         ]
-    for plate in entities.get("possible_plates", []):
-        links += [
-            {"category":"possibile_targa", "value":plate, "name":"Google", "url":google_url(f'"{plate}"')},
-            {"category":"possibile_targa", "value":plate, "name":"Subito", "url":google_url(f'site:subito.it "{plate}"')},
-            {"category":"possibile_targa", "value":plate, "name":"Autoscout", "url":google_url(f'site:autoscout24.it "{plate}"')}
-        ]
-    for domain in entities.get("domains", []):
-        links += [
-            {"category":"dominio", "value":domain, "name":"Google site:", "url":google_url(f"site:{domain}")},
-            {"category":"dominio", "value":domain, "name":"WHOIS", "url":google_url(f"whois {domain}")},
-            {"category":"dominio", "value":domain, "name":"Wayback", "url":f"https://web.archive.org/web/*/{domain}"}
-        ]
     return links
 
 def entity_queries(entities):
@@ -311,8 +321,7 @@ def entity_queries(entities):
         queries += [
             {"type":"telefono", "value":phone, "query":f'"{phone}"'},
             {"type":"telefono-facebook", "value":phone, "query":f'site:facebook.com "{phone}"'},
-            {"type":"telefono-instagram", "value":phone, "query":f'site:instagram.com "{phone}"'},
-            {"type":"telefono-subito", "value":phone, "query":f'site:subito.it "{phone}"'}
+            {"type":"telefono-instagram", "value":phone, "query":f'site:instagram.com "{phone}"'}
         ]
     for email in entities.get("emails", []):
         queries += [
@@ -325,24 +334,12 @@ def entity_queries(entities):
         queries += [
             {"type":"username", "value":user, "query":f'"{clean}"'},
             {"type":"username-instagram", "value":user, "query":f'site:instagram.com "{clean}"'},
-            {"type":"username-tiktok", "value":user, "query":f'site:tiktok.com "{clean}"'},
-            {"type":"username-x", "value":user, "query":f'site:x.com "{clean}" OR site:twitter.com "{clean}"'}
+            {"type":"username-tiktok", "value":user, "query":f'site:tiktok.com "{clean}"'}
         ]
-    for plate in entities.get("possible_plates", []):
-        queries += [
-            {"type":"possibile-targa", "value":plate, "query":f'"{plate}"'},
-            {"type":"possibile-targa-web", "value":plate, "query":f'"{plate}" auto OR veicolo OR targa'}
-        ]
-    for url in entities.get("urls", []):
-        queries.append({"type":"url", "value":url, "query":f'"{url}"'})
-    for domain in entities.get("domains", []):
-        queries.append({"type":"dominio", "value":domain, "query":f'site:{domain}'})
     return queries
 
 def investigative_profile(entities, gps=None, ocr=None, exif=None):
-    gps = gps or {}
-    ocr = ocr or {}
-    exif = exif or {}
+    gps, ocr, exif = gps or {}, ocr or {}, exif or {}
     counts = {k: len(v) for k, v in entities.items() if isinstance(v, list)}
     score = 0
     score += counts.get("phones", 0) * 20
@@ -352,9 +349,12 @@ def investigative_profile(entities, gps=None, ocr=None, exif=None):
     score += counts.get("domains", 0) * 10
     score += counts.get("possible_plates", 0) * 25
     score += counts.get("possible_fiscal_codes", 0) * 30
-    if gps.get("latitude") is not None: score += 15
-    if ocr.get("text"): score += 10
-    if exif.get("Software"): score += 5
+    if gps.get("latitude") is not None:
+        score += 15
+    if ocr.get("text"):
+        score += 10
+    if exif.get("Software"):
+        score += 5
     score = min(score, 100)
     priority = "HIGH" if score >= 70 else "MEDIUM" if score >= 35 else "LOW"
     actions = []
@@ -363,9 +363,7 @@ def investigative_profile(entities, gps=None, ocr=None, exif=None):
     if counts.get("usernames", 0): actions += ["Verifica username sui social principali"]
     if counts.get("domains", 0): actions += ["Verifica dominio con WHOIS/DNS/Wayback"]
     if counts.get("possible_plates", 0): actions += ["Verifica manualmente possibile targa", "Controlla errori OCR su caratteri simili"]
-    if gps.get("latitude") is not None: actions += ["Verifica coordinate su mappa", "Confronta luogo con contesto immagine"]
-    if ocr.get("text"): actions += ["Rileggi manualmente il testo OCR", "Confronta numeri/nomi estratti con l'immagine originale"]
-    actions += ["Esegui reverse image search se pertinente", "Documenta fonte, data, hash e passaggi eseguiti"]
+    actions += ["Documenta fonte, data, hash e passaggi eseguiti"]
     return {"score": score, "priority": priority, "entity_counts": counts, "recommended_actions": unique(actions)}
 
 def reverse_sources():
@@ -378,75 +376,157 @@ def reverse_sources():
     ]
 
 def build_queries(filename, exif, gps, ocr_text, manual, entities):
-    stem = Path(filename).stem
+    stem = Path(filename).stem if filename else ""
     queries = []
     if stem:
-        queries += [f'"{stem}"', f'site:facebook.com "{stem}"', f'site:instagram.com "{stem}"', f'site:x.com "{stem}" OR site:twitter.com "{stem}"']
+        queries += [f'"{stem}"', f'site:facebook.com "{stem}"', f'site:instagram.com "{stem}"']
     make, model = str(exif.get("Make","")).strip(), str(exif.get("Model","")).strip()
-    if make or model: queries.append(f'"{(make+" "+model).strip()}"')
-    dt = exif.get("DateTimeOriginal") or exif.get("DateTime")
-    if dt: queries.append(f'"{dt}"')
-    if gps.get("latitude") is not None and gps.get("longitude") is not None:
-        queries.append(f'"{gps["latitude"]}" "{gps["longitude"]}"')
+    if make or model:
+        queries.append(f'"{(make+" "+model).strip()}"')
     if ocr_text:
         words = " ".join(ocr_text.split()[:8])
-        if words: queries.append(f'"{words}"')
+        if words:
+            queries.append(f'"{words}"')
     for q in entity_queries(entities):
         queries.append(q["query"])
-    for key in ["luogo","telecamera","veicolo","targa","abbigliamento","oggetti","note"]:
-        val = str(manual.get(key,"")).strip()
-        if val: queries.append(f'"{val}"')
-    if filename: queries.append(f'"{filename}"')
     return unique(queries)
 
-def checklist(exif, gps, ocr, manual, entities):
-    items = [
-        "Conservare copia originale e hash SHA256 per catena di custodia digitale.",
-        "Verificare data/ora di acquisizione e fonte del file originale.",
-        "Usare reverse image search manuale per eventuali copie online.",
-        "Non usare il sistema per identificazione automatica o riconoscimento facciale."
-    ]
-    if gps.get("latitude") is not None:
-        items.append("GPS presente: verificare coerenza del luogo su mappa.")
-    else:
-        items.append("GPS assente: usare luogo/telecamera dichiarati o ricostruzione manuale.")
-    if ocr.get("text"):
-        items.append("OCR utile: verificare targhe, insegne, numeri, orari o parole estratte.")
-    if entities.get("phones"):
-        items.append("Telefono individuato: effettuare ricerche OSINT solo su fonti pubbliche/autorizzate.")
-    if entities.get("emails") or entities.get("usernames"):
-        items.append("Identificativi online individuati: verificare corrispondenze con più fonti.")
-    if entities.get("possible_plates"):
-        items.append("Possibile targa individuata: verificare manualmente, OCR può commettere errori.")
-    return items
+# ---------------- AI NON IDENTIFICATIVE ----------------
+
+def opencv_analysis(image):
+    if not AI["opencv"]:
+        return {"enabled": False, "note": "OpenCV non installato."}
+    try:
+        arr = np.array(image.convert("RGB"))
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        face_count = 0
+        boxes = []
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+        for (x, y, w, h) in faces:
+            face_count += 1
+            boxes.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h)})
+        return {
+            "enabled": True,
+            "sharpness_laplacian": round(lap_var, 2),
+            "face_count_non_identifying": face_count,
+            "face_boxes": boxes,
+            "note": "Rilevamento volto non identificativo: non riconosce identità."
+        }
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
+
+def blur_faces_base64(image, face_boxes):
+    try:
+        img = image.convert("RGB")
+        for b in face_boxes or []:
+            x, y, w, h = b["x"], b["y"], b["w"], b["h"]
+            crop = img.crop((x, y, x+w, y+h)).filter(ImageFilter.GaussianBlur(radius=18))
+            img.paste(crop, (x, y))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+def mediapipe_analysis(image):
+    if not AI["mediapipe"]:
+        return {"enabled": False, "note": "MediaPipe non installato."}
+    try:
+        arr = np.array(image.convert("RGB"))
+        with mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as fd:
+            results = fd.process(arr)
+            detections = results.detections or []
+            return {
+                "enabled": True,
+                "face_detections": len(detections),
+                "note": "MediaPipe usato solo per rilevamento non identificativo, non per riconoscere persone."
+            }
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
+
+def yolo_analysis(image):
+    global YOLO_MODEL
+    if not AI["yolo"]:
+        return {"enabled": False, "note": "YOLO non installato."}
+    try:
+        if YOLO_MODEL is None:
+            YOLO_MODEL = YOLO("yolov8n.pt")
+        arr = np.array(image.convert("RGB"))
+        results = YOLO_MODEL(arr, verbose=False)
+        items = []
+        for r in results:
+            names = r.names
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                xyxy = [float(x) for x in box.xyxy[0]]
+                items.append({"label": names.get(cls_id, str(cls_id)), "confidence": round(conf, 3), "box": xyxy})
+        return {"enabled": True, "objects": items[:30], "note": "YOLO rileva oggetti/veicoli/persone come classi, non identifica individui."}
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
+
+def clip_analysis(image):
+    global CLIP_MODEL, CLIP_PROCESSOR
+    if not AI["clip"]:
+        return {"enabled": False, "note": "CLIP non installato."}
+    try:
+        if CLIP_MODEL is None:
+            CLIP_MODEL = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            CLIP_PROCESSOR = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        labels = [
+            "a person", "a car", "a motorcycle", "a bicycle", "a backpack",
+            "a helmet", "a phone", "a street sign", "a building entrance",
+            "a document with text", "a social media screenshot", "a CCTV frame"
+        ]
+        inputs = CLIP_PROCESSOR(text=labels, images=image.convert("RGB"), return_tensors="pt", padding=True)
+        with torch.no_grad():
+            outputs = CLIP_MODEL(**inputs)
+            probs = outputs.logits_per_image.softmax(dim=1)[0].tolist()
+        ranked = sorted([{"label": l, "score": round(p, 4)} for l, p in zip(labels, probs)], key=lambda x: x["score"], reverse=True)
+        return {"enabled": True, "semantic_labels": ranked[:8], "note": "CLIP usato per descrivere scena/oggetti, non per identità facciale."}
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
+
+def ai_suite(image):
+    cv = opencv_analysis(image)
+    return {
+        "ai_status": AI,
+        "opencv": cv,
+        "mediapipe": mediapipe_analysis(image),
+        "yolo": yolo_analysis(image),
+        "clip": clip_analysis(image),
+        "privacy_blur_preview": blur_faces_base64(image, cv.get("face_boxes", [])) if cv.get("face_boxes") else None,
+        "safety_note": "AI non identificativa: nessuna ricerca facciale online, nessun riconoscimento identità."
+    }
 
 def text_osint_report(text, manual=None):
     manual = manual or {}
     entities = extract_entities(text, "", {}, manual)
-    enriched = enrich_entities(entities)
-    profile = investigative_profile(entities)
     return {
-        "software":"IVAN-OSINT Investigativo v6",
+        "software":"IVAN-OSINT Investigativo v9",
         "mode":"text_osint",
         "created_at": datetime.datetime.utcnow().isoformat()+"Z",
         "input_text": text,
         "case_manual_fields": manual,
-        "investigative_profile": profile,
+        "investigative_profile": investigative_profile(entities),
         "entities": entities,
-        "entity_enrichment": enriched,
+        "entity_enrichment": enrich_entities(entities),
         "entity_queries": entity_queries(entities),
         "epieos_like_links": epieos_like_links(entities),
         "queries": build_queries("", {}, {}, text, manual, entities),
-        "legal_note": "Uso previsto: OSINT su dati autorizzati e fonti aperte. Le verifiche automatiche sono euristiche e non confermano identità."
+        "legal_note": "Uso previsto: OSINT su dati autorizzati e fonti aperte. Le verifiche automatiche sono euristiche."
     }
 
 @app.get("/")
 def home():
-    return jsonify({"software":"IVAN-OSINT Investigativo v6 Backend","status":"online","features":["image_osint","text_osint","entity_enrichment","epieos_like_links","investigative_profile","ocr","exif","gps"]})
+    return jsonify({"software":"IVAN-OSINT Investigativo v9 Backend","status":"online","ai_status":AI,"features":["OCR","OpenCV optional","MediaPipe optional","YOLO optional","CLIP optional","text_osint","image_osint"]})
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "time": datetime.datetime.utcnow().isoformat()+"Z"})
+    return jsonify({"ok": True, "time": datetime.datetime.utcnow().isoformat()+"Z", "ai_status": AI})
 
 @app.post("/analyze-text")
 def analyze_text():
@@ -475,15 +555,15 @@ def analyze_image():
     manual = {}
     raw_manual = request.form.get("manual","")
     if raw_manual:
-        try: manual = json.loads(raw_manual)
-        except Exception: manual = {}
+        try:
+            manual = json.loads(raw_manual)
+        except Exception:
+            manual = {}
 
     exif, gps = extract_exif(image)
     quality = image_quality(image)
     ocr = ocr_space(data, filename)
     entities = extract_entities(ocr.get("text",""), filename, exif, manual)
-    serpapi_on = bool(os.environ.get("SERPAPI_KEY","").strip())
-    profile = investigative_profile(entities, gps, ocr, exif)
 
     technical = {
         "filename": filename,
@@ -500,17 +580,17 @@ def analyze_image():
     }
 
     warnings = []
-    if not exif: warnings.append("Nessun EXIF trovato. Normale per social, WhatsApp, screenshot, CCTV o editor.")
-    if gps.get("latitude") is None: warnings.append("Nessun GPS trovato nei metadati.")
-    if not ocr.get("enabled"): warnings.append("OCR non attivo: aggiungere OCR_SPACE_API_KEY su Render se serve.")
-    if not serpapi_on: warnings.append("SERPAPI_KEY non presente: reverse image automatico non attivo.")
+    if not exif:
+        warnings.append("Nessun EXIF trovato. Normale per social, WhatsApp, screenshot, CCTV o editor.")
+    if gps.get("latitude") is None:
+        warnings.append("Nessun GPS trovato nei metadati.")
 
     return jsonify({
-        "software":"IVAN-OSINT Investigativo v6",
+        "software":"IVAN-OSINT Investigativo v9",
         "mode":"image_osint",
         "created_at": datetime.datetime.utcnow().isoformat()+"Z",
         "case_manual_fields": manual,
-        "investigative_profile": profile,
+        "investigative_profile": investigative_profile(entities, gps, ocr, exif),
         "technical": technical,
         "quality": quality,
         "exif": exif,
@@ -520,12 +600,12 @@ def analyze_image():
         "entity_enrichment": enrich_entities(entities),
         "entity_queries": entity_queries(entities),
         "epieos_like_links": epieos_like_links(entities),
-        "api_status": {"ocr_space":{"enabled": bool(os.environ.get("OCR_SPACE_API_KEY","").strip())}, "serpapi":{"enabled": serpapi_on}},
+        "ai_suite": ai_suite(image),
+        "api_status": {"ocr_space":{"enabled": bool(os.environ.get("OCR_SPACE_API_KEY","").strip())}, "serpapi":{"enabled": bool(os.environ.get("SERPAPI_KEY","").strip())}},
         "queries": build_queries(filename, exif, gps, ocr.get("text",""), manual, entities),
         "reverse_image_sources": reverse_sources(),
-        "investigative_checklist": checklist(exif, gps, ocr, manual, entities),
         "warnings": warnings,
-        "legal_note": "Uso previsto: analisi tecnica e OSINT su dati autorizzati. Nessun riconoscimento facciale."
+        "legal_note": "Uso previsto: analisi tecnica e OSINT su dati autorizzati. Nessun riconoscimento facciale identificativo."
     })
 
 if __name__ == "__main__":
