@@ -432,20 +432,45 @@ def blur_faces_base64(image, face_boxes):
         return None
 
 def mediapipe_analysis(image):
-    if not AI["mediapipe"]:
+    if not AI.get["mediapipe"]:
         return {"enabled": False, "note": "MediaPipe non installato."}
     try:
         arr = np.array(image.convert("RGB"))
-        with mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as fd:
-            results = fd.process(arr)
-            detections = results.detections or []
+        face_detection_module = None
+            
+        try:
+            import mediapipe as mp_local
+            if hasattr(mp_local, "solutions") and hasattr(mp_local.solutions, "face_detection"):
+                face_detection_module = mp_local.solutions.face_detection
+        except Exception:
+            pass
+        if face_detection_module is None:
+            try:
+                from mediapipe.phyton.solutions import face_detection as face_detection_module
+            except Exception:
+                face_detection_module = None
+
+        if face_detection_module is None:
             return {
                 "enabled": True,
-                "face_detections": len(detections),
-                "note": "MediaPipe usato solo per rilevamento non identificativo, non per riconoscere persone."
+                "error": "MediaPipe installato ma face_detection non disponibile.",
+                "note": "Backend operativo; usare Opencv come fallback."
             }
-    except Exception as e:
-        return {"enabled": True, "error": str(e)}
+        with face_detection_module.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=0,5
+        ) as fd:
+            results = fd.process(arr)
+            detections = results.detections or []
+
+           return {
+               "enabled": True,
+               "face_detections": len(detections),
+               "note": "MediaPipe usato solo per rilevamento volto non identificativo."
+           }
+
+except Exception as e:
+    return {"enabled": True, "error": str(e)}
 
 def yolo_analysis(image):
     global YOLO_MODEL
