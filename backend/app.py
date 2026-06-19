@@ -521,7 +521,7 @@ def build_queries(filename, exif, gps, ocr_text, manual, entities):
         words = " ".join(ocr_text.split()[:8])
         if words:
             queries.append(f'"{words}"')
-    for q in entity_queries(entities):
+    for q in (entity_queries(entities) or []):
         queries.append(q["query"])
     return unique(queries)
 
