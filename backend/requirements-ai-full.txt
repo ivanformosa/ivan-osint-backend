@@ -9,3 +9,4 @@ ultralytics==8.3.40
 torch
 transformers==4.41.2
 tokenizers==0.19.1
+sherlock-project
