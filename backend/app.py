@@ -552,6 +552,68 @@ def opencv_analysis(image):
     except Exception as e:
         return {"enabled": True, "error": str(e)}
 
+PLATE_REGEX = re.compile(r"\b[A-Z]{2}\s?\d{3}\s?[A-Z]{2}\b")
+
+def enhance_image_for_ocr(image):
+    try:
+        img = image.convert("RGB")
+        arr = np.array(img)
+
+        if cv2 is None or np is None:
+            return image
+
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        enhanced = cv2.resize(
+            enhanced,
+            None,
+            fx=2,
+            fy=2,
+            interpolation=cv2.INTER_CUBIC
+        )
+
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        enhanced = cv2.filter2D(enhanced, -1, kernel)
+
+        return Image.fromarray(enhanced)
+
+    except Exception:
+        return image
+
+
+def enhanced_ocr_space(image, filename):
+    try:
+        enhanced = enhance_image_for_ocr(image)
+        buf = io.BytesIO()
+        enhanced.convert("RGB").save(buf, format="JPEG", quality=95)
+        enhanced_data = buf.getvalue()
+        return ocr_space(enhanced_data, "enhanced_" + filename)
+    except Exception as e:
+        return {
+            "enabled": True,
+            "provider": "OCR.space",
+            "text": "",
+            "error": str(e),
+            "note": "OCR potenziato non riuscito."
+        }
+
+
+def extract_plate_candidates(text):
+    raw = (text or "").upper()
+    found = []
+
+    for p in PLATE_REGEX.findall(raw):
+        found.append(p.replace(" ", ""))
+
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    found += re.findall(r"[A-Z]{2}\d{3}[A-Z]{2}", compact)
+
+    return unique(found)
+    
 def blur_faces_base64(image, face_boxes):
     try:
         img = image.convert("RGB")
