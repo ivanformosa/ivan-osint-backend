@@ -5,7 +5,8 @@ from PIL import Image, ExifTags, ImageStat, ImageFilter
 from pathlib import Path
 from urllib.parse import quote_plus
 import hashlib, io, os, json, datetime, requests, re, base64
-
+import subprocess
+import sys
 app = Flask(__name__)
 CORS(app)
 
@@ -314,8 +315,133 @@ def epieos_like_links(entities):
             {"category":"username", "value":user, "name":"Telegram", "url":f"https://t.me/{clean}"}
         ]
     return links
+SHERLOCK_MAX_USERNAMES = 3
+SHERLOCK_TIMEOUT_SECONDS = 120
 
-def entity_queries(entities):
+def sanitize_username_for_sherlock(username):
+    username = (username or "").strip().lstrip("@")
+    username = re.sub(r"[^A-Za-z0-9._-]", "", username)
+    return username[:40]
+
+def parse_sherlock_output(output):
+    results = []
+    for line in (output or "").splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+
+        if clean.startswith("[+]"):
+            clean = clean[3:].strip()
+
+        if "http://" in clean or "https://" in clean:
+            if ":" in clean:
+                parts = clean.split(":", 1)
+                site = parts[0].strip(" :-[]+")
+                url = parts[1].strip()
+
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif not url.startswith("http"):
+                    if "http" in clean:
+                        url = clean[clean.find("http"):].strip()
+
+                results.append({
+                    "site": site or "unknown",
+                    "url": url,
+                    "raw": line
+                })
+            else:
+                url = clean[clean.find("http"):].strip()
+                results.append({
+                    "site": "unknown",
+                    "url": url,
+                    "raw": line
+                })
+
+    out = []
+    seen = set()
+    for r in results:
+        url = r.get("url", "")
+        if url and url not in seen:
+            out.append(r)
+            seen.add(url)
+
+    return out
+
+def run_sherlock_username(username):
+    username = sanitize_username_for_sherlock(username)
+
+    if not username:
+        return {
+            "username": username,
+            "ok": False,
+            "error": "Username non valido."
+        }
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "sherlock_project",
+        username,
+        "--timeout",
+        "10",
+        "--print-found",
+        "--no-color"
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=SHERLOCK_TIMEOUT_SECONDS
+        )
+
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        found = parse_sherlock_output(stdout)
+
+        return {
+            "username": username,
+            "ok": completed.returncode in [0, 1],
+            "returncode": completed.returncode,
+            "found_count": len(found),
+            "found_profiles": found,
+            "stdout_tail": stdout[-3000:],
+            "stderr_tail": stderr[-1500:],
+            "note": "Risultati da verificare manualmente. Sherlock consulta profili pubblici e può produrre falsi positivi/negativi."
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "username": username,
+            "ok": False,
+            "error": "Timeout Sherlock: ricerca troppo lunga.",
+            "found_count": 0,
+            "found_profiles": []
+        }
+
+    except Exception as e:
+        return {
+            "username": username,
+            "ok": False,
+            "error": str(e),
+            "found_count": 0,
+            "found_profiles": []
+        }
+
+def sherlock_bulk_usernames(usernames):
+    clean = []
+
+    for u in usernames or []:
+        s = sanitize_username_for_sherlock(u)
+        if s and s not in clean:
+            clean.append(s)
+
+    clean = clean[:SHERLOCK_MAX_USERNAMES]
+
+    return [run_sherlock_username(u) for u in clean]
+    def entity_queries(entities):
     queries = []
     for phone in entities.get("phones", []):
         queries += [
