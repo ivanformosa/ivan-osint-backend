@@ -776,6 +776,28 @@ def analyze_image():
         "warnings": warnings,
         "legal_note": "Uso previsto: analisi tecnica e OSINT su dati autorizzati. Nessun riconoscimento facciale identificativo."
     })
+     
+@app.post("/sherlock-username")
+def sherlock_username_endpoint():
+    payload = request.get_json(silent=True) or {}
+    username = payload.get("username") or payload.get("user") or ""
+    return jsonify(run_sherlock_username(username))
 
+
+
+@app.post("/sherlock-bulk")
+def sherlock_bulk_endpoint():
+    payload = request.get_json(silent=True) or {}
+    usernames = payload.get("usernames") or []
+
+    if isinstance(usernames, str):
+        usernames = [usernames]
+
+    return jsonify({
+        "ok": True,
+        "max_usernames": SHERLOCK_MAX_USERNAMES,
+        "results": sherlock_bulk_usernames(usernames),
+        "note": "Ricerca limitata per evitare timeout su Render."
+    })
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","5000")))
