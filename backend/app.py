@@ -794,7 +794,18 @@ def analyze_image():
     exif, gps = extract_exif(image)
     quality = image_quality(image)
     ocr = ocr_space(data, filename)
-    ocr_text = ocr.get("text", "")
+    enhanced_ocr = enhanced_ocr_space(image, filename)
+
+    ocr_text = "\n".join([
+        ocr.get("text, ""),
+        enhanced_ocr.get("text", "")
+    ]).strip()
+
+    ocr_text = ocr_text.upper()
+    ocr["text"] =ocr_text
+
+    plate_candidates = extract_plate_candidates(ocr_text)
+    
     # OCR aggressivo per targhe e testi piccoli
     ocr_text = ocr_text.upper()
 
@@ -837,6 +848,8 @@ def analyze_image():
         "exif": exif,
         "gps": gps,
         "ocr": ocr,
+        "enhanced_ocr": enhanced:ocr,
+        "plate_candidates": plate_candidates,
         "entities": entities,
         "entity_enrichment": enrich_entities(entities),
         "entity_queries": entity_queries(entities),
