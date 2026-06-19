@@ -732,7 +732,17 @@ def analyze_image():
     exif, gps = extract_exif(image)
     quality = image_quality(image)
     ocr = ocr_space(data, filename)
-    entities = extract_entities(ocr.get("text",""), filename, exif, manual)
+    ocr_text = ocr.get("text", "")
+    # OCR aggressivo per targhe e testi piccoli
+    ocr_text = ocr_text.upper()
+
+    ocr["text"] = ocr_text
+    entities = extract_entities(
+        ocr_text,
+        filename,
+        exif,
+        manual
+    )
 
     technical = {
         "filename": filename,
