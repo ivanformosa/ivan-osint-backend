@@ -446,27 +446,31 @@ def sherlock_bulk_usernames(usernames):
 
     
 def entity_queries(entities):
-        queries = []
+    queries = []
+
     for phone in entities.get("phones", []):
         queries += [
-            {"type":"telefono", "value":phone, "query":f'"{phone}"'},
-            {"type":"telefono-facebook", "value":phone, "query":f'site:facebook.com "{phone}"'},
-            {"type":"telefono-instagram", "value":phone, "query":f'site:instagram.com "{phone}"'}
+            {"type": "telefono", "value": phone, "query": f'"{phone}"'},
+            {"type": "telefono-facebook", "value": phone, "query": f'site:facebook.com "{phone}"'},
+            {"type": "telefono-instagram", "value": phone, "query": f'site:instagram.com "{phone}"'}
         ]
+
     for email in entities.get("emails", []):
         queries += [
-            {"type":"email", "value":email, "query":f'"{email}"'},
-            {"type":"email-linkedin", "value":email, "query":f'site:linkedin.com "{email}"'},
-            {"type":"email-github", "value":email, "query":f'site:github.com "{email}"'}
+            {"type": "email", "value": email, "query": f'"{email}"'},
+            {"type": "email-linkedin", "value": email, "query": f'site:linkedin.com "{email}"'},
+            {"type": "email-github", "value": email, "query": f'site:github.com "{email}"'}
         ]
+
     for user in entities.get("usernames", []):
         clean = user.lstrip("@")
         queries += [
-            {"type":"username", "value":user, "query":f'"{clean}"'},
-            {"type":"username-instagram", "value":user, "query":f'site:instagram.com "{clean}"'},
-            {"type":"username-tiktok", "value":user, "query":f'site:tiktok.com "{clean}"'}
+            {"type": "username", "value": user, "query": f'"{clean}"'},
+            {"type": "username-instagram", "value": user, "query": f'site:instagram.com "{clean}"'},
+            {"type": "username-tiktok", "value": user, "query": f'site:tiktok.com "{clean}"'}
         ]
-    return queries
+
+        return queries
 
 def investigative_profile(entities, gps=None, ocr=None, exif=None):
     gps, ocr, exif = gps or {}, ocr or {}, exif or {}
