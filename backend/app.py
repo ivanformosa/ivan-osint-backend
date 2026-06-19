@@ -796,11 +796,7 @@ def analyze_image():
     ocr = ocr_space(data, filename)
     enhanced_ocr = enhanced_ocr_space(image, filename)
 
-    ocr_text = "\n".join([
-        ocr.get("text, ""),
-        enhanced_ocr.get("text", "")
-    ]).strip()
-
+    ocr_text = ocr_text = (ocr.get("text", "") + "\n" + enhanced_ocr.get("text", "")).strip()
     ocr_text = ocr_text.upper()
     ocr["text"] =ocr_text
 
