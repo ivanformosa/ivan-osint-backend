@@ -445,8 +445,8 @@ def sherlock_bulk_usernames(usernames):
 
 
     
-    def entity_queries(entities):
-    queries = []
+def entity_queries(entities):
+        queries = []
     for phone in entities.get("phones", []):
         queries += [
             {"type":"telefono", "value":phone, "query":f'"{phone}"'},
