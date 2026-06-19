@@ -848,7 +848,7 @@ def analyze_image():
         "exif": exif,
         "gps": gps,
         "ocr": ocr,
-        "enhanced_ocr": enhanced:ocr,
+        "enhanced_ocr": enhanced_ocr,
         "plate_candidates": plate_candidates,
         "entities": entities,
         "entity_enrichment": enrich_entities(entities),
